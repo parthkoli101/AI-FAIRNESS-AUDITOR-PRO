@@ -733,7 +733,12 @@ async function runAPIBlackboxTest() {
 // AI-DRIVEN STRESS TESTING (PRE & POST) — fully automatic
 // ══════════════════════════════════════════════════════════
 async function fetchJson(url, options = {}) {
-  const res = await fetch(url, { credentials: 'include', ...options });
+  let res;
+  try {
+    res = await fetch(url, { credentials: 'include', ...options });
+  } catch (err) {
+    throw new Error('Failed to reach the backend. Make sure the Flask/Render app is running and reload the page.');
+  }
   const contentType = res.headers.get('content-type') || '';
   let data = null;
   if (contentType.includes('application/json')) {
@@ -741,10 +746,23 @@ async function fetchJson(url, options = {}) {
   } else {
     const text = await res.text();
     if (res.status === 401) throw new Error('Session expired. Please log in again.');
-    throw new Error(text?.slice(0, 180) || `Request failed (${res.status})`);
+    if ((contentType.includes('text/html') || /^\s*</.test(text || '')) && res.status >= 500) {
+      throw new Error(`Server error (${res.status}). Check Render logs for the backend traceback.`);
+    }
+    throw new Error(text?.replace(/\s+/g, ' ').trim().slice(0, 180) || `Request failed (${res.status})`);
   }
   if (!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);
   return data;
+}
+
+function limitStressRows(rows, maxRows = 1000) {
+  if (!Array.isArray(rows) || rows.length <= maxRows) return rows;
+  const step = rows.length / maxRows;
+  const sampled = [];
+  for (let i = 0; i < maxRows; i++) {
+    sampled.push(rows[Math.floor(i * step)]);
+  }
+  return sampled;
 }
 
 async function loadStressDataset(isPre) {
@@ -776,10 +794,11 @@ async function runAiDatasetStressTest(mode) {
   showEl(loadingEl); hideEl(resultsEl);
 
   try {
-    const df_data = await loadStressDataset(isPre);
+    let df_data = await loadStressDataset(isPre);
     if (!df_data || !df_data.length) {
       throw new Error('Could not parse dataset. Upload a valid CSV or JSON file.');
     }
+    df_data = limitStressRows(df_data);
 
     const data = await fetchJson('/api/stress/run_dataset_test', {
       method: 'POST',
