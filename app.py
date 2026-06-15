@@ -71,6 +71,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 
+LOCAL_DEV_ORIGINS = {
+    "http://localhost:3000", "http://127.0.0.1:3000",
+    "http://localhost:5000", "http://127.0.0.1:5000",
+    "http://localhost:5500", "http://127.0.0.1:5500",
+    "null",
+}
+
 # Configure Gemini if available
 if GEMINI_LIB_AVAILABLE and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -156,6 +163,22 @@ def login_required(f):
     return decorated
 
 # ─── Smart Text-to-DataFrame Parser ──────────────────────────────────────────
+@app.after_request
+def add_local_dev_cors_headers(response):
+    origin = request.headers.get("Origin")
+    if origin in LOCAL_DEV_ORIGINS and request.path.startswith("/api/"):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    return response
+
+
+@app.route("/api/<path:_path>", methods=["OPTIONS"])
+def api_options(_path):
+    return ("", 204)
+
+
 def parse_text_as_dataset(text, source_hint="txt"):
     import re
     import io
@@ -4468,20 +4491,48 @@ def api_stress_run_baseline_profiles():
     return jsonify({"results": results, "protected_attr": resolved_attr})
 
 
+def _load_stress_dataframe_from_request():
+    if "file_data" in request.files and "file_pred" in request.files:
+        mode1, data1 = load_uploaded_file(request.files["file_data"])
+        mode2, data2 = load_uploaded_file(request.files["file_pred"])
+        if mode1 != "dataframe" or mode2 != "dataframe":
+            return None, "Both stress-test files must be CSV/JSON/XLSX."
+        if len(data1) != len(data2):
+            return None, f"Row count mismatch: data={len(data1)}, predictions={len(data2)}."
+        return pd.concat([data1.reset_index(drop=True), data2.reset_index(drop=True)], axis=1), None
+
+    if "file" in request.files and request.files["file"].filename:
+        mode, data = load_uploaded_file(request.files["file"])
+        if mode == "error":
+            return None, data
+        if mode != "dataframe":
+            return None, "Stress testing requires a structured CSV, JSON, or XLSX file."
+        return data, None
+
+    return None, "No stress-test file uploaded."
+
+
 @app.route("/api/stress/run_dataset_test", methods=["POST"])
 @login_required
 def api_stress_run_dataset_test():
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No data sent"}), 400
+        if request.files:
+            df_data, load_error = _load_stress_dataframe_from_request()
+            if load_error:
+                return jsonify({"error": load_error}), 400
+            protected_attr = request.form.get("protected_attr", "auto")
+            mode = request.form.get("mode", "pre")
+            code = request.form.get("code", "")
+        else:
+            data = request.get_json(silent=True)
+            if not data:
+                return jsonify({"error": "No data sent"}), 400
+            df_data = data.get("df_data")
+            protected_attr = data.get("protected_attr", "gender")
+            mode = data.get("mode", "pre")
+            code = data.get("code", "")
 
-        df_data = data.get("df_data")
-        protected_attr = data.get("protected_attr", "gender")
-        mode = data.get("mode", "pre")
-        code = data.get("code", "")
-
-        if not df_data:
+        if df_data is None or (not isinstance(df_data, pd.DataFrame) and not df_data):
             return jsonify({"error": "No dataset data provided"}), 400
 
         result = run_dataset_stress_test(df_data, protected_attr, mode=mode, code=code)
