@@ -15,6 +15,7 @@ from flask import (Flask, render_template, request, jsonify,
                    session, redirect, url_for, flash, make_response)
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
@@ -4486,7 +4487,26 @@ def api_stress_run_dataset_test():
         result = run_dataset_stress_test(df_data, protected_attr, mode=mode, code=code)
         if result.get("error"):
             return jsonify(result), 400
-        return jsonify(normalize_for_mongo(result))
+        try:
+            return jsonify(normalize_for_mongo(result))
+        except Exception as e:
+            traceback.print_exc()
+            compact = {
+                "explanation": result.get("explanation", ""),
+                "sections": result.get("sections", {}),
+                "summary": result.get("summary", {}),
+                "metrics": result.get("metrics", {}),
+                "counterfactual_bias_score": result.get("counterfactual_bias_score", 0),
+                "risk_level": result.get("risk_level", "UNKNOWN"),
+                "protected_attr": result.get("protected_attr", protected_attr),
+                "auto_selected_attribute": result.get("auto_selected_attribute", protected_attr),
+                "selection_reason": result.get("selection_reason", ""),
+                "profiles_tested": result.get("profiles_tested", 0),
+                "successful_predictions": result.get("successful_predictions", 0),
+                "results": result.get("results", [])[:50],
+                "warning": f"Returned compact stress result after serialization fallback: {type(e).__name__}",
+            }
+            return jsonify(normalize_for_mongo(compact))
     except Exception as e:
         traceback.print_exc()
         return jsonify({
@@ -4507,6 +4527,32 @@ def api_stress_analyze_grid_outcomes():
 
     analysis = analyze_stress_results(results, protected_attr)
     return jsonify(normalize_for_mongo(analysis))
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_request_too_large(e):
+    if request.path.startswith("/api/"):
+        return jsonify({
+            "error": "Uploaded data is too large for the server. Use a smaller file or fewer rows for stress testing."
+        }), 413
+    return e
+
+
+@app.errorhandler(HTTPException)
+def handle_api_http_exception(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": e.description or e.name}), e.code
+    return e
+
+
+@app.errorhandler(Exception)
+def handle_api_exception(e):
+    if request.path.startswith("/api/"):
+        traceback.print_exc()
+        return jsonify({
+            "error": f"Server error: {type(e).__name__}: {str(e)}"
+        }), 500
+    raise e
 
 
 if __name__ == "__main__":
