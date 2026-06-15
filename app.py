@@ -117,6 +117,33 @@ def call_ai(prompt, max_tokens=1000, temperature=0.2):
     return None
 
 # ─── Auth Helpers ────────────────────────────────────────────────────────────
+def get_groq_stress_error():
+    if not GROQ_API_KEY:
+        return "Groq is required for AI stress testing. Set GROQ_API_KEY locally and on Render."
+    if not GROQ_LIB_AVAILABLE:
+        return "Groq package is not installed. Ensure requirements.txt installs groq."
+    return None
+
+
+def call_groq_for_stress(prompt, max_tokens=700, temperature=0.2):
+    """Stress testing is intentionally Groq-only."""
+    err = get_groq_stress_error()
+    if err:
+        return None, err
+    try:
+        client = groq_lib.Groq(api_key=GROQ_API_KEY)
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature
+        )
+        return response.choices[0].message.content.strip(), None
+    except Exception as e:
+        traceback.print_exc()
+        return None, f"Groq stress analysis failed: {type(e).__name__}: {str(e)}"
+
+
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -442,7 +469,7 @@ PROTECTED_KEYWORDS = [
 def detect_protected_attributes(df):
     found = []
     for col in df.columns:
-        col_lower = col.lower()
+        col_lower = str(col).lower()
         for kw in PROTECTED_KEYWORDS:
             if kw in col_lower:
                 found.append(col)
@@ -452,7 +479,7 @@ def detect_protected_attributes(df):
 def bin_age_column(df):
     df = df.copy()
     for col in df.columns:
-        if "age" in col.lower() and pd.api.types.is_numeric_dtype(df[col]):
+        if "age" in str(col).lower() and pd.api.types.is_numeric_dtype(df[col]):
             bins = [0, 25, 35, 45, 60, 200]
             labels = ["18-25", "26-35", "36-45", "46-60", "60+"]
             df[col] = pd.cut(df[col], bins=bins, labels=labels, right=True)
@@ -471,7 +498,7 @@ POSITIVE_VALUES = {
 
 def detect_target_column(df):
     for col in df.columns:
-        if col.lower().strip() in TARGET_KEYWORDS:
+        if str(col).lower().strip() in TARGET_KEYWORDS:
             return col
     return None
 
@@ -3833,6 +3860,17 @@ def _auto_select_stress_attribute(df):
             if any(kw in col_lower for kw in ("gender", "race", "age", "sex", "ethnic")):
                 attrs.append(col)
     if not attrs:
+        target_col = detect_target_column(df_binned)
+        for col in df_binned.columns:
+            if col == target_col:
+                continue
+            try:
+                unique_count = int(df_binned[col].dropna().astype(str).nunique())
+            except Exception:
+                unique_count = 0
+            if 2 <= unique_count <= 20:
+                return col, "fallback: categorical column with multiple groups"
+    if not attrs:
         return None, "No protected attributes detected in dataset."
 
     target_col = detect_target_column(df_binned)
@@ -4012,9 +4050,12 @@ STRICT RULES:
 - Do NOT write long paragraphs. Keep each section concise.
 - Do not confuse aggregate group rates with counterfactual sensitivity.
 """
-    ai_text = call_ai(prompt, max_tokens=700, temperature=0.2) or ""
+    ai_text, groq_error = call_groq_for_stress(prompt, max_tokens=700, temperature=0.2)
+    ai_text = ai_text or ""
     sections = _parse_stress_sections(ai_text)
     if len(sections) < 3:
+        if groq_error:
+            return {"error": groq_error}
         sections = _build_stress_sections(protected_attr, pair_metrics, mode_label)
     explanation = "\n\n".join([f"{k}:\n{v}" for k, v in sections.items()])
 
@@ -4029,19 +4070,95 @@ STRICT RULES:
     }
 
 
+def _select_surrogate_target_column(df, protected_attr):
+    target_col = detect_target_column(df)
+    if target_col and target_col in df.columns:
+        return target_col
+    resolved_attr = _resolve_column_name(df, protected_attr) or protected_attr
+    for col in df.columns:
+        if col != resolved_attr:
+            return col
+    return None
+
+
+def _profile_column_value(profile, col):
+    if col in profile:
+        return profile.get(col)
+    lookup = {str(k).lower().strip(): v for k, v in profile.items()}
+    return lookup.get(str(col).lower().strip(), "")
+
+
+def _profile_distance(profile, row, feature_columns, template_df):
+    distance = 0.0
+    compared = 0
+    for col in feature_columns:
+        left = _profile_column_value(profile, col)
+        right = _profile_column_value(row, col)
+        if pd.isna(left) or pd.isna(right) or left == "" or right == "":
+            continue
+        compared += 1
+        if col in template_df.columns and pd.api.types.is_numeric_dtype(template_df[col]):
+            try:
+                series = pd.to_numeric(template_df[col], errors="coerce")
+                scale = float(series.max() - series.min()) or 1.0
+                distance += abs(float(left) - float(right)) / scale
+            except Exception:
+                distance += 1.0
+        else:
+            distance += 0.0 if str(left).lower().strip() == str(right).lower().strip() else 1.0
+    if compared == 0:
+        return float("inf")
+    return distance
+
+
+def run_lightweight_baseline_predictions(df, profiles, protected_attr):
+    """Pure-Pandas fallback for Render environments where sklearn is unavailable."""
+    df_model = bin_age_column(_coerce_dataframe_types(df.copy()))
+    target_col = _select_surrogate_target_column(df_model, protected_attr)
+    if not target_col or target_col not in df_model.columns:
+        return None, "Could not find a target or prediction column for stress testing."
+
+    y = convert_to_binary(df_model[target_col])
+    feature_columns = [c for c in df_model.columns if c != target_col]
+    if not feature_columns:
+        default_pred = int(round(float(y.mean()))) if len(y) else 0
+        return [{"profile": row, "result": default_pred} for row in profiles], None
+
+    rows = df_model[feature_columns].to_dict(orient="records")
+    labels = y.tolist()
+    default_pred = int(round(float(y.mean()))) if len(y) else 0
+    results = []
+
+    for row in profiles:
+        safe_row = _sanitize_profile(row)
+        try:
+            best_idx = None
+            best_dist = float("inf")
+            for idx, train_row in enumerate(rows):
+                dist = _profile_distance(safe_row, train_row, feature_columns, df_model)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            pred = int(labels[best_idx]) if best_idx is not None and best_dist != float("inf") else default_pred
+            results.append({"profile": safe_row, "result": pred})
+        except Exception as e:
+            results.append({"profile": safe_row, "result": default_pred, "warning": str(e)})
+
+    return results, None
+
+
 def run_baseline_predictions(df, profiles, protected_attr):
     resolved_attr = _resolve_column_name(df, protected_attr) or protected_attr
     df_model = bin_age_column(_coerce_dataframe_types(df.copy()))
-    clf = train_baseline_model(df_model, resolved_attr)
+    try:
+        clf = train_baseline_model(df_model, resolved_attr)
+    except Exception:
+        traceback.print_exc()
+        clf = None
     if not clf:
-        return None, "Could not train baseline classifier. Ensure the dataset has feature columns and a binary outcome column (e.g. hired, approved, label)."
+        return run_lightweight_baseline_predictions(df_model, profiles, resolved_attr)
 
-    target_col = detect_target_column(df_model)
-    if not target_col:
-        for c in df_model.columns:
-            if _resolve_column_name(df_model, c) != resolved_attr and c != resolved_attr:
-                target_col = c
-                break
+    target_col = _select_surrogate_target_column(df_model, resolved_attr)
     feature_columns = [c for c in df_model.columns if c != target_col]
 
     results = []
@@ -4056,10 +4173,17 @@ def run_baseline_predictions(df, profiles, protected_attr):
 
 
 def run_dataset_stress_test(df_data, protected_attr=None, mode="pre", code=""):
+    groq_error = get_groq_stress_error()
+    if groq_error:
+        return {"error": groq_error}
+
     try:
         df = _coerce_dataframe_types(pd.DataFrame(df_data))
     except Exception as e:
         return {"error": f"Invalid dataset: {str(e)}"}
+
+    if len(df) > 5000:
+        df = df.sample(n=5000, random_state=42)
 
     if len(df) < 5:
         return {"error": "Dataset too small for stress testing (need at least 5 rows)."}
@@ -4346,22 +4470,28 @@ def api_stress_run_baseline_profiles():
 @app.route("/api/stress/run_dataset_test", methods=["POST"])
 @login_required
 def api_stress_run_dataset_test():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No data sent"}), 400
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data sent"}), 400
 
-    df_data = data.get("df_data")
-    protected_attr = data.get("protected_attr", "gender")
-    mode = data.get("mode", "pre")
-    code = data.get("code", "")
+        df_data = data.get("df_data")
+        protected_attr = data.get("protected_attr", "gender")
+        mode = data.get("mode", "pre")
+        code = data.get("code", "")
 
-    if not df_data:
-        return jsonify({"error": "No dataset data provided"}), 400
+        if not df_data:
+            return jsonify({"error": "No dataset data provided"}), 400
 
-    result = run_dataset_stress_test(df_data, protected_attr, mode=mode, code=code)
-    if result.get("error"):
-        return jsonify(result), 400
-    return jsonify(normalize_for_mongo(result))
+        result = run_dataset_stress_test(df_data, protected_attr, mode=mode, code=code)
+        if result.get("error"):
+            return jsonify(result), 400
+        return jsonify(normalize_for_mongo(result))
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "error": f"Stress test failed on server: {type(e).__name__}: {str(e)}"
+        }), 500
 
 
 @app.route("/api/stress/analyze_grid_outcomes", methods=["POST"])
