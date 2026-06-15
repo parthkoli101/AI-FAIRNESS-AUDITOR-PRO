@@ -139,7 +139,7 @@ def call_groq_for_stress(prompt, max_tokens=700, temperature=0.2):
     if err:
         return None, err
     try:
-        client = groq_lib.Groq(api_key=GROQ_API_KEY)
+        client = groq_lib.Groq(api_key=GROQ_API_KEY, timeout=18.0)
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
@@ -4078,8 +4078,6 @@ STRICT RULES:
     ai_text = ai_text or ""
     sections = _parse_stress_sections(ai_text)
     if len(sections) < 3:
-        if groq_error:
-            return {"error": groq_error}
         sections = _build_stress_sections(protected_attr, pair_metrics, mode_label)
     explanation = "\n\n".join([f"{k}:\n{v}" for k, v in sections.items()])
 
@@ -4091,6 +4089,8 @@ STRICT RULES:
         "counterfactual_bias_score": overall_bias_score,
         "risk_level": score_to_risk(overall_bias_score),
         "pair_metrics": pair_metrics,
+        "ai_provider": "groq" if ai_text and not groq_error else "groq_timeout_fallback",
+        "ai_warning": groq_error or "",
     }
 
 
@@ -4174,33 +4174,10 @@ def run_lightweight_baseline_predictions(df, profiles, protected_attr):
 def run_baseline_predictions(df, profiles, protected_attr):
     resolved_attr = _resolve_column_name(df, protected_attr) or protected_attr
     df_model = bin_age_column(_coerce_dataframe_types(df.copy()))
-    try:
-        clf = train_baseline_model(df_model, resolved_attr)
-    except Exception:
-        traceback.print_exc()
-        clf = None
-    if not clf:
-        return run_lightweight_baseline_predictions(df_model, profiles, resolved_attr)
-
-    target_col = _select_surrogate_target_column(df_model, resolved_attr)
-    feature_columns = [c for c in df_model.columns if c != target_col]
-
-    results = []
-    for row in profiles:
-        try:
-            row_df = _align_profile_row(row, feature_columns, df_model)
-            pred = int(clf.predict(row_df)[0])
-            results.append({"profile": row, "result": pred})
-        except Exception as e:
-            results.append({"profile": row, "error": str(e)})
-    return results, None
+    return run_lightweight_baseline_predictions(df_model, profiles, resolved_attr)
 
 
 def run_dataset_stress_test(df_data, protected_attr=None, mode="pre", code=""):
-    groq_error = get_groq_stress_error()
-    if groq_error:
-        return {"error": groq_error}
-
     try:
         df = _coerce_dataframe_types(pd.DataFrame(df_data))
     except Exception as e:
