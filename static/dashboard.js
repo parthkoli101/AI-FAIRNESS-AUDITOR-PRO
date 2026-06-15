@@ -734,9 +734,16 @@ async function runAPIBlackboxTest() {
 // ══════════════════════════════════════════════════════════
 async function fetchJson(url, options = {}) {
   let res;
+  const isLocalPage = ['localhost', '127.0.0.1', ''].includes(window.location.hostname);
+  const localApiUrl = url.startsWith('/api/') && isLocalPage && window.location.port !== '5000'
+    ? `http://127.0.0.1:5000${url}`
+    : url;
   try {
-    res = await fetch(url, { credentials: 'include', ...options });
+    res = await fetch(localApiUrl, { credentials: 'include', ...options });
   } catch (err) {
+    if (localApiUrl !== url) {
+      throw new Error('Failed to reach Flask at http://127.0.0.1:5000. Start app.py, then reload the dashboard.');
+    }
     throw new Error('Failed to reach the backend. Make sure the Flask/Render app is running and reload the page.');
   }
   const contentType = res.headers.get('content-type') || '';
@@ -777,6 +784,27 @@ async function loadStressDataset(isPre) {
   return fileToJson(state.postFile);
 }
 
+function buildStressFormData(isPre) {
+  const fd = new FormData();
+  fd.append('protected_attr', 'auto');
+  fd.append('mode', isPre ? 'pre' : 'post');
+
+  if (isPre) {
+    fd.append('file', state.preFile);
+    return fd;
+  }
+
+  if (state.postMode === 'split' && state.postFileData && state.postFilePred) {
+    fd.append('file_data', state.postFileData);
+    fd.append('file_pred', state.postFilePred);
+    fd.append('prediction_col', document.getElementById('postSplitPredCol')?.value || '');
+    return fd;
+  }
+
+  fd.append('file', state.postFile);
+  return fd;
+}
+
 async function runAiDatasetStressTest(mode) {
   const isPre = mode === 'pre';
   const loadingEl = isPre ? 'preStressLoading' : 'stressLoading';
@@ -794,20 +822,9 @@ async function runAiDatasetStressTest(mode) {
   showEl(loadingEl); hideEl(resultsEl);
 
   try {
-    let df_data = await loadStressDataset(isPre);
-    if (!df_data || !df_data.length) {
-      throw new Error('Could not parse dataset. Upload a valid CSV or JSON file.');
-    }
-    df_data = limitStressRows(df_data);
-
     const data = await fetchJson('/api/stress/run_dataset_test', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        df_data,
-        protected_attr: 'auto',
-        mode: isPre ? 'pre' : 'post',
-      }),
+      body: buildStressFormData(isPre),
     });
 
     const resolvedAttr = data.protected_attr || data.auto_selected_attribute || 'attribute';
