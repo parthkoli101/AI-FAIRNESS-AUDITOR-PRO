@@ -3,6 +3,7 @@ import json
 import math
 import uuid
 import time
+import csv
 import textwrap
 import subprocess
 import tempfile
@@ -4487,6 +4488,233 @@ def _load_stress_dataframe_from_request():
         return data, None
 
     return None, "No stress-test file uploaded."
+
+
+def _light_clean_value(value):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in ("nan", "none", "null") else text
+
+
+def _light_parse_uploaded_rows(file):
+    filename = secure_filename(file.filename or "").lower()
+    ext = filename.rsplit(".", 1)[-1] if "." in filename else "csv"
+
+    if ext == "json":
+        try:
+            raw = json.loads(file.read().decode("utf-8", errors="replace"))
+            rows = raw.get("data", raw.get("records", [])) if isinstance(raw, dict) else raw
+            if not isinstance(rows, list):
+                return None, "JSON stress file must be a list of records."
+            return [{str(k): _light_clean_value(v) for k, v in r.items()} for r in rows if isinstance(r, dict)], None
+        except Exception as e:
+            return None, f"Could not parse JSON stress file: {str(e)}"
+
+    if ext in ("xlsx", "xls"):
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(file, read_only=True, data_only=True)
+            ws = wb.active
+            values = list(ws.iter_rows(values_only=True))
+            if len(values) < 2:
+                return None, "Spreadsheet must include a header row and at least one data row."
+            headers = [str(h).strip() if h is not None else f"column_{i+1}" for i, h in enumerate(values[0])]
+            rows = []
+            for vals in values[1:]:
+                rows.append({headers[i]: _light_clean_value(vals[i] if i < len(vals) else "") for i in range(len(headers))})
+            return rows, None
+        except Exception as e:
+            return None, f"Could not parse spreadsheet stress file: {str(e)}"
+
+    try:
+        text = file.read().decode("utf-8-sig", errors="replace")
+        sample = text[:4096]
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except Exception:
+            dialect = csv.excel
+        reader = csv.DictReader(StringIO(text), dialect=dialect)
+        rows = [{str(k): _light_clean_value(v) for k, v in row.items() if k is not None} for row in reader]
+        return rows, None
+    except Exception as e:
+        return None, f"Could not parse CSV stress file: {str(e)}"
+
+
+def _light_load_stress_rows_from_request():
+    if "file_data" in request.files and "file_pred" in request.files:
+        rows1, err1 = _light_parse_uploaded_rows(request.files["file_data"])
+        rows2, err2 = _light_parse_uploaded_rows(request.files["file_pred"])
+        if err1 or err2:
+            return None, err1 or err2
+        if len(rows1) != len(rows2):
+            return None, f"Row count mismatch: data={len(rows1)}, predictions={len(rows2)}."
+        return [dict(a, **b) for a, b in zip(rows1, rows2)], None
+
+    if "file" not in request.files or not request.files["file"].filename:
+        return None, "No stress-test file uploaded."
+    return _light_parse_uploaded_rows(request.files["file"])
+
+
+def _light_as_float(value):
+    try:
+        text = str(value).replace(",", "").strip()
+        return float(text) if text != "" else None
+    except Exception:
+        return None
+
+
+def _light_detect_target_col(rows):
+    if not rows:
+        return None
+    keys = list(rows[0].keys())
+    for key in keys:
+        if str(key).lower().strip() in TARGET_KEYWORDS:
+            return key
+    return keys[-1] if keys else None
+
+
+def _light_detect_attr(rows, target_col):
+    if not rows:
+        return None, "No rows available."
+    keys = [k for k in rows[0].keys() if k != target_col]
+    candidates = []
+    for key in keys:
+        values = [str(r.get(key, "")).strip() for r in rows if str(r.get(key, "")).strip()]
+        unique = sorted(set(values))
+        lower = str(key).lower()
+        if any(kw in lower for kw in PROTECTED_KEYWORDS) and 2 <= len(unique) <= 30:
+            candidates.append(key)
+    if not candidates:
+        for key in keys:
+            values = [str(r.get(key, "")).strip() for r in rows if str(r.get(key, "")).strip()]
+            unique = sorted(set(values))
+            numeric_count = sum(1 for v in values if _light_as_float(v) is not None)
+            if 2 <= len(unique) <= 20 and numeric_count < max(1, int(len(values) * 0.8)):
+                return key, "fallback: categorical column with multiple groups"
+        return None, "No protected or categorical attribute detected for stress testing."
+
+    best_attr = candidates[0]
+    best_gap = -1.0
+    for attr in candidates:
+        groups = {}
+        for row in rows:
+            group = str(row.get(attr, "")).strip()
+            if not group:
+                continue
+            groups.setdefault(group, []).append(_normalize_prediction_outcome(row.get(target_col, 0)))
+        rates = [sum(vals) / len(vals) for vals in groups.values() if vals]
+        if len(rates) >= 2:
+            gap = max(rates) - min(rates)
+            if gap > best_gap:
+                best_gap = gap
+                best_attr = attr
+    reason = f"highest outcome disparity (SPD={round(best_gap, 3)})" if best_gap >= 0 else "first detected protected attribute"
+    return best_attr, reason
+
+
+def _light_distance(a, b, feature_cols):
+    distance = 0.0
+    compared = 0
+    for col in feature_cols:
+        av = a.get(col, "")
+        bv = b.get(col, "")
+        if av == "" or bv == "":
+            continue
+        compared += 1
+        af = _light_as_float(av)
+        bf = _light_as_float(bv)
+        if af is not None and bf is not None:
+            scale = max(abs(af), abs(bf), 1.0)
+            distance += abs(af - bf) / scale
+        else:
+            distance += 0.0 if str(av).lower().strip() == str(bv).lower().strip() else 1.0
+    return distance if compared else float("inf")
+
+
+def _light_predict_counterfactuals(rows, profiles, target_col):
+    feature_cols = [c for c in rows[0].keys() if c != target_col]
+    labels = [_normalize_prediction_outcome(row.get(target_col, 0)) for row in rows]
+    default_pred = int(round(sum(labels) / len(labels))) if labels else 0
+    results = []
+    for profile in profiles:
+        best_idx = None
+        best_dist = float("inf")
+        for idx, row in enumerate(rows):
+            dist = _light_distance(profile, row, feature_cols)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        pred = labels[best_idx] if best_idx is not None and best_dist != float("inf") else default_pred
+        results.append({"profile": profile, "result": pred})
+    return results
+
+
+def run_light_stress_test_from_rows(rows, protected_attr="auto", mode="pre"):
+    rows = [r for r in rows if isinstance(r, dict)]
+    if len(rows) > 1000:
+        step = len(rows) / 1000
+        rows = [rows[int(i * step)] for i in range(1000)]
+    if len(rows) < 5:
+        return {"error": "Dataset too small for stress testing (need at least 5 rows)."}
+
+    target_col = _light_detect_target_col(rows)
+    if not target_col:
+        return {"error": "Could not find a target or prediction column for stress testing."}
+
+    if not protected_attr or str(protected_attr).strip().lower() in ("", "auto"):
+        resolved_attr, selection_reason = _light_detect_attr(rows, target_col)
+    else:
+        lookup = {str(k).lower().strip(): k for k in rows[0].keys()}
+        resolved_attr = lookup.get(str(protected_attr).lower().strip())
+        selection_reason = "user-specified attribute"
+    if not resolved_attr:
+        return {"error": selection_reason or "Could not auto-detect a protected attribute."}
+
+    attr_values = sorted({str(r.get(resolved_attr, "")).strip() for r in rows if str(r.get(resolved_attr, "")).strip()})
+    if len(attr_values) < 2:
+        return {"error": f"'{resolved_attr}' must contain at least 2 distinct groups for counterfactual testing."}
+
+    sample_rows = rows[:5]
+    profiles = []
+    for idx, row in enumerate(sample_rows):
+        base = {k: _light_clean_value(v) for k, v in row.items() if k != target_col}
+        for attr_val in attr_values:
+            profile = dict(base)
+            profile[resolved_attr] = attr_val
+            profile["_stress_type"] = f"real_row_{idx}"
+            profiles.append(profile)
+
+    pred_results = _light_predict_counterfactuals(rows, profiles, target_col)
+    mode_label = "pre-training dataset model" if mode == "pre" else "post-training prediction model"
+    analysis = analyze_stress_results(pred_results, resolved_attr, mode_label=mode_label)
+    if analysis.get("error"):
+        return analysis
+    analysis["results"] = pred_results
+    analysis["protected_attr"] = resolved_attr
+    analysis["auto_selected_attribute"] = resolved_attr
+    analysis["selection_reason"] = selection_reason
+    analysis["profiles_tested"] = len(pred_results)
+    analysis["successful_predictions"] = len(pred_results)
+    return analysis
+
+
+@app.route("/api/stress/run_dataset_test_light", methods=["POST"])
+@login_required
+def api_stress_run_dataset_test_light():
+    try:
+        rows, err = _light_load_stress_rows_from_request()
+        if err:
+            return jsonify({"error": err}), 400
+        protected_attr = request.form.get("protected_attr", "auto")
+        mode = request.form.get("mode", "pre")
+        result = run_light_stress_test_from_rows(rows, protected_attr=protected_attr, mode=mode)
+        if result.get("error"):
+            return jsonify(result), 400
+        return jsonify(normalize_for_mongo(result))
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Light stress test failed: {type(e).__name__}: {str(e)}"}), 500
 
 
 @app.route("/api/stress/run_dataset_test", methods=["POST"])
