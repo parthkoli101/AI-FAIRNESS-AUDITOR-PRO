@@ -822,7 +822,7 @@ async function runAiDatasetStressTest(mode) {
   showEl(loadingEl); hideEl(resultsEl);
 
   try {
-    const data = await fetchJson('/api/stress/run_dataset_test', {
+    const data = await fetchJson('/api/stress/run_dataset_test_light', {
       method: 'POST',
       body: buildStressFormData(isPre),
     });
